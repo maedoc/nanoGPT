@@ -41,7 +41,6 @@ class CausalSelfAttention(nn.Module):
         # causal mask to ensure that attention is only applied to the left in the input sequence
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1, 1, config.block_size, config.block_size))
-        self.phi = nn.functional.gelu
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -52,8 +51,11 @@ class CausalSelfAttention(nn.Module):
         # replace 1/z (which didn't work) by a z-score (like layer norm but simpler)
         q, k, v = (qkv - qkv.mean(axis=-1)[...,None])/qkv.std(dim=-1)[...,None]
 
-        # s = self.phi(q) @ self.phi(k).transpose(-2, -1)
-        s = self.phi(q @ k.transpose(-2, -1))
+        # erf is less typical than relu/gelu but it's the core op in Destexhe's TFs
+        phi = torch.erf
+
+        # salience
+        s = phi(q) @ phi(k).transpose(-2, -1)
 
         # "causal" salience, just apply mask
         cs = s * self.bias[:,:,:T,:T]
