@@ -42,29 +42,27 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1, 1, config.block_size, config.block_size))
 
+    def vt1(self, T, qkv, phi=torch.erf):  # vl 1.77
+        # TODO need to return z scale v also
+        q, k, v = (qkv - qkv.mean(axis=-1)[...,None])/qkv.std(dim=-1)[...,None]
+        s = phi(q) @ phi(k).transpose(-2, -1)
+        return (s * self.bias[:,:,:T,:T]) @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+    def vt2(self, T, qkv):  # vl 1.76
+        return self.vt1(T, qkv, phi=nn.functional.gelu)
+
+    def vt0(self, T, qkv, phi=nn.functional.gelu):  # vl 4.7
+        q, k, v = qkv
+        z = (q @ k.transpose(-2, -1)).sum(dim=-1)[..., None] + 1e-6
+        s = phi(q) @ phi(k).transpose(-2, -1) / z
+        return (s * self.bias[:,:,:T,:T]) @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-  
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x).view(B,T,3,self.n_head,C//self.n_head).permute(2,0,3,1,4)
-
-        # replace 1/z (which didn't work) by a z-score (like layer norm but simpler)
-        q, k, v = (qkv - qkv.mean(axis=-1)[...,None])/qkv.std(dim=-1)[...,None]
-
-        # erf is less typical than relu/gelu but it's the core op in Destexhe's TFs
-        phi = torch.erf
-
-        # salience
-        s = phi(q) @ phi(k).transpose(-2, -1)
-
-        # "causal" salience, just apply mask
-        cs = s * self.bias[:,:,:T,:T]
-        self.cs = cs  # store it for visualization
-
-        # \tilde v
-        y = cs @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        *_, v = qkv = self.c_attn(x).view(B,T,3,self.n_head,C//self.n_head).permute(2,0,3,1,4)
+        vt = self.vt1(T, qkv)
+        y = vt.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         return self.c_proj(y)
 
 
