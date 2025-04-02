@@ -32,97 +32,144 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-        self.phi = nn.functional.gelu
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+        # w decay & eta icl-lr
+        self.forward = self.rwkv7_forward
+        self.hs_eye = torch.eye(self.n_embd // self.n_head).to('cuda')
+        if self.forward == self.rwkv7_forward:
+            scl = 1/config.block_size
+            self.w = nn.Parameter(torch.zeros(self.n_embd) + scl)
+            self.eta = nn.Parameter(torch.zeros(self.n_embd) + scl)
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def mhsa_forward(self, x, phi=torch.erf): #lambda x: 1/(1+torch.exp(-x))):  # torch.erf):
+        B, T, C = x.size()
+        # projection to cortex
+        qkv = self.c_attn(x).view(B,T,3,self.n_head,C//self.n_head).permute(2,0,3,1,4)
+        # layernorm/zscore/precision weighted prediction errors
+        q, k, v = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
+        # l23 salience
+        s = phi(q) @ phi(k).transpose(-2, -1)
+        # l5 transformed values
+        vt = (s * self.bias[:,:,:T,:T]) @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # project back to thalamus
+        y = vt.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        # thalamus has skip connection
+        return x + y
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    # https://raw.githubusercontent.com/BlinkDL/RWKV-LM/main/RWKV-v7.png
+    # but very close to linear self attention yet learns faster? @iter1000 vl 1.79
+    # 
+    def rwkv7_forward(self, x, phi=torch.erf):
+        B, T, C = x.size()
+        nh, hs = self.n_head, C // self.n_head
+        # projection to cortex
+        qkv = self.c_attn(x).view(B,T,3,nh,hs) # (B,T,3,nh,hs)
+        # layernorm/zscore/precision weighted prediction errors
+        qkv = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
+        # -> (3,T,B,nh,hs)
+        q, k, v = qkv.transpose(0,2)
+        q, k = phi(q), phi(k)
+        w = self.w.view(nh, hs)
+        eta = self.eta.view(nh, hs)
+        a, b, v_, k_ = -k, k*eta, v, k*eta
+        ab = torch.einsum('tbhi,tbhj->tbhij', a, b)
+        state = torch.zeros(B, nh, hs, hs).to('cuda')
         # import pdb; pdb.set_trace()
+        vt = []
+        for t in range(T):
+            sab = torch.einsum("bhik,bhk,bhj->bhij", state, a[t], b[t])
+            state = torch.einsum('bhik,hi->bhik', state, w)
+            state = state + sab + torch.einsum('bhj,bhi->bhij', k_[t], v_[t])
+            vt.append(torch.einsum('bhj,bhij->bhi', q[t], state))
+            assert torch.isfinite(state).all(), f'div at t={T}'
+        vt = torch.stack(vt)  # (T, B, nh, hs)
+        y = vt.transpose(0, 1).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        # thalamus has skip connection
+        return x + y
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            z = (q @ k.transpose(-2, -1)).sum(dim=-1).view(B, self.n_head, T, 1)
-            phi = nn.functional.gelu
-            att = phi(q) @ phi(k).transpose(-2, -1)
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, 0) #float('-inf'))
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # import pdb; pdb.set_trace()
+    # https://arxiv.org/pdf/2406.06484
+    def deltanet_forward(self, x, phi=torch.erf, esum=torch.einsum):
+        B, T, C = x.size()
+        nh, hs = self.n_head, C // self.n_head
+        # projection to cortex
+        qkv = self.c_attn(x).view(B,T,3,nh,hs) # (B,T,3,nh,hs)
+        # layernorm/zscore/precision weighted prediction errors
+        qkv = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
+        # -> (3,T,B,nh,hs)
+        q, k, v = qkv.transpose(0,2)
+        q, k = phi(q), phi(k)
+        beta = self.eta[0]
+        L = self.hs_eye - beta*esum('tbhi,tbhj->tbhij', k, k)
+        I = beta*esum('tbhi,tbhj->tbhij', k, v)
+        S = torch.zeros(B, nh, hs, hs).to('cuda')
+        vt = []
+        for t in range(T):
+            S = esum('bhij,bhjk->bhik', S, L[t]) + I[t]
+            vt.append(esum('bhj,bhij->bhi', q[t], S))
+            assert torch.isfinite(S).all(), f'div at t={T}'
+        vt = torch.stack(vt)  # (T, B, nh, hs)
+        y = vt.transpose(0, 1).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        # thalamus has skip connection
+        return x + y
 
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+    # https://proceedings.mlr.press/v119/katharopoulos20a.html w/o Z
+    # does not work with saturating (on the right), needs relu/gelu etc
+    def lsa_forward(self, x, phi=F.gelu):#lambda x: 1/(1+torch.exp(-x))):  # torch.erf):
+        B, T, C = x.size()
+        nh, hs = self.n_head, C // self.n_head
+        qkv = self.c_attn(x).view(B,T,3,nh,hs) # (B,T,3,nh,hs)
+        qkv = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
+        q, k, v = qkv.transpose(0,2)
+        # state updates can be done recurrently or batch like here for training
+        ds = torch.einsum('tbhi,tbhj->tbhij', phi(k), v)
+        state = torch.cumsum(ds, dim=0)
+        vt = torch.einsum('tbhi,tbhij->tbhj', phi(q), state)
+        y = vt.transpose(0, 1).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return x + y  # skip  here important for performance, don't remove
 
-class MLP(nn.Module):
 
+
+class DeltaNet(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        # x = x + self.attn(self.ln_1(x))
-        # x = x + self.mlp(self.ln_2(x))
-        # import pdb; pdb.set_trace()
-        return x + self.attn(self.ln_1(x))
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()    
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-    def forward(self, x):
-        # ln seems to serve to stabilize training, w/o it we get nan
-        # it's just a scaled z-score lol
-        import pdb
-        # pdb.set_trace()
-        B, T, C = x.shape
-        z = (x - x.mean(dim=-1).view(B, T, 1)) / x.std(dim=-1).view(B, T, 1)
-        return x + self.attn(z) #self.ln_1(x))
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.hs_eye = torch.eye(self.n_embd // self.n_head).to('cuda') * 0.99
+    # https://arxiv.org/pdf/2406.06484
+    def forward(self, x, phi=torch.erf, esum=torch.einsum):
+        B, T, C = x.size()
+        nh, hs = self.n_head, C // self.n_head
+        qkv = self.c_attn(x).view(B,T,3,nh,hs) # (B,T,3,nh,hs)
+        qkv = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
+        q, k, v = qkv.transpose(0,2)
+        b = 0.01
+        L = self.hs_eye - b*esum('tbhi,tbhj->tbhij', k, k)
+        I = esum('tbhi,tbhj->tbhij', k, v)
+        S = torch.zeros(B, nh, hs, hs).to('cuda')
+        vt = []
+        for t in range(T):
+            S = esum('bhij,bhjk->bhik', S, L[t]) + I[t]
+            vt.append(esum('bhj,bhij->bhi', q[t], S))
+            # assert torch.isfinite(S).all(), f'div at t={T}'
+        vt = torch.stack(vt)  # (T, B, nh, hs)
+        y = vt.transpose(0, 1).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return x + y
 
 @dataclass
 class GPTConfig:
@@ -145,23 +192,23 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            # drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([CausalSelfAttention(config) for _ in range(config.n_layer)]),
+            # ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.00002/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -180,11 +227,11 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.0002)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.0002)
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -195,14 +242,24 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # 1.77 instead of 1.79 if we keep dropout
+        # x = self.transformer.drop(tok_emb + pos_emb) 
+
+        # DEBUG DEBUG
+        self.x_trace = []
+        x = tok_emb # + pos_emb
+        self.x_trace.append(x)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+            self.x_trace.append(x)
+        # x = self.transformer.ln_f(x)
+        x = (x - x.mean(axis=-1)[...,None]) / x.std(dim=-1)[...,None]
+        
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            self.x_trace.append(logits)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
