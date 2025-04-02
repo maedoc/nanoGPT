@@ -3,9 +3,9 @@ import numpy as np, os, pickle, tqdm, jax, jax.numpy as jp
 # setup
 key = jax.random.PRNGKey(42)
 batch_size = 1
-nl, n_head, vocab_size = 2, 2, 65
-n_embd = n_head * 8
-nh, hs = n_head, n_embd//n_head
+nl, n_head, vocab_size = 8, 8, 65
+n_embd = n_head * 32
+nh, hs = n_head, n_embd // n_head
 B, C = batch_size, n_embd
 
 # params
@@ -38,21 +38,47 @@ def step(pso, ix, iy, lr=1e-4):
         yoh = jax.nn.one_hot(iy, logits.shape[-1])
         ll = -(jax.nn.log_softmax(logits, axis=-1) * yoh).sum(axis=-1)
         return ll[0], s, o
-    p, _ = jax.lax.scan(lambda p, i: (
-        jax.tree_util.tree_map(
-            lambda p,g: p-lr*g, p,
-            jax.grad(lambda p: f(p, s, o)[0])(p)), None), p, jp.r_[:20])
-    ll, s, o = f(p, s, o)  # final prediction
-    return (p, s, o), ll
-    
+    ll0, _, _ = f(p, s, o)  # initial prediction
+    # ll is 0 to 5 or so, use it to choose number of gradient steps
+    nsteps = jp.array([(ll0+1)**2], jp.int32)[0]
+    whval = nsteps, p
+
+    def whcond(c):
+        n, p = c
+        return n > 0
+
+    def whbody(c):
+        n, p = c
+        p = jax.tree_util.tree_map(
+                lambda p, g: p - lr * g, p,
+                jax.grad(lambda p: f(p, s, o)[0])(p))
+        return n-1, p
+
+    _, p = jax.lax.while_loop(whcond, whbody, whval)
+
+    if False:
+        p, _ = jax.lax.scan(lambda p, i: (
+            jax.tree_util.tree_map(
+                lambda p,g: p-lr*g, p,
+                jax.grad(lambda p: f(p, s, o)[0])(p)), None), p, jp.r_[:nsteps])
+
+    ll1, s, o = f(p, s, o)  # final prediction
+    return (p, s, o), ll0, ll1, nsteps
+
+
 s = jp.zeros((nl, B, nh, hs, hs))
 o = jp.zeros((nl, B, C)) + 1e-3
 pso = p0, s, o
 import tqdm
-data = np.r_[:vocab_size]
-np.random.shuffle(data)
-print(data)
-for i in (pbar := tqdm.trange(50000)):
-    pso, ll = step(pso, data[i%data.size], data[(i+1)%data.size])
-    if i % 10 == 0:
-        pbar.set_description(f'll = {ll:0.2f}')
+if False:
+    data = np.r_[:vocab_size]
+    np.random.shuffle(data)
+else:
+    import genarith
+    data = np.array(genarith.gentokens(50000))
+for i in (pbar := tqdm.trange(data.size-1)):
+    ix, iy = data[i], data[i+1]
+    pso, ll0, ll1, nn = step(pso, ix, iy)
+    if i > 10:
+        expr = ''.join([chr(_) for _ in data[i-9:i+1]])
+        pbar.set_description(f'"{expr}: {ll0:+0.2f}->{ll1:+0.2f}"')
