@@ -17,7 +17,7 @@ batch_size = 8
 n_layer, n_head, n_embd, vocab_size = 4, 3, 24, 65
 nh, hs = n_head, n_embd//n_head
 B, T, C = batch_size, block_size, n_embd
-beta = 0.01
+mask = jp.tril(jp.ones((T,T)))
 
 # params
 wte = jax.random.normal(key, shape=(vocab_size, n_embd)) * 0.0002
@@ -30,15 +30,62 @@ print(f'{param_counts/1e6:0.2f} M params')
 
 Z = lambda x: (x - x.mean(axis=-1)[...,None])/x.std(ddof=1, axis=-1)[...,None]
 
-def model(params, x, phi=jax.nn.gelu):
+parallel = True
+def model1(params, x, phi=jax.nn.gelu):
     Wi, Wo, lm_head, wte = params
     x = wte[x] # B, T, C
     for wi, wo in zip(Wi, Wo):
-        q, k, v = Z(jp.einsum('ij,bti->btj', wi, x).reshape(B,T,3,nh,hs)).swapaxes(0,2)
-        state = jp.cumsum(jp.einsum('tbhi,tbhj->tbhij', phi(k), v), axis=0)
-        vt = jp.einsum('tbhi,tbhij->tbhj', phi(q), state)
-        x = jp.swapaxes(vt,0,1).reshape(B,T,C) @ wo + x
+        q, k, v = Z(jp.einsum('ij,bti->btj', wi, x).reshape(B,T,3,nh,hs)).swapaxes(0,2)  # (3,T,B,nh,hs)
+        if parallel:
+            s = jp.einsum('ibhd,jbhd->ijbh', phi(q), phi(k))
+            vt = jp.einsum('ijbh,ij,jbhd->ibhd', s, mask, v)
+        else:
+            state = jp.cumsum(jp.einsum('tbhi,tbhj->tbhij', phi(k), v), axis=0)
+            vt = jp.einsum('tbhi,tbhij->tbhj', phi(q), state)
+        x = vt.swapaxes(0,1).reshape(B,T,C) @ wo + x
     return Z(x) @ lm_head
+
+
+def model2_layer(s, wi, wo, xt, phi=jax.nn.gelu):
+    q, k, v = Z(jp.einsum('ij,bi->bj', wi, xt).reshape(B,3,nh,hs)).swapaxes(0,1)
+    s = s + jp.einsum('bhi,bhj->bhij', phi(k), v)
+    vt = jp.einsum('bhi,bhij->bhj', phi(q), s)
+    xt = vt.reshape(B,C) @ wo + xt
+    return s, xt
+
+def model2(params, x):
+    Wi, Wo, lm_head, wte = params
+    nl = Wi.shape[0]
+    x = wte[x].swapaxes(0, 1)
+    assert x.shape == (T, B, C)
+    # swap layer & token loops, but otherwise the same for now
+    S = jp.zeros((nl, B, nh, hs, hs))
+    for t in range(T):
+        xt = x[t] # (B,C)
+        for i, (wi, wo) in enumerate(zip(Wi, Wo)):
+            s, xt = model2_layer(S[i], wi, wo, xt)
+            S = S.at[i].set(s)
+        x = x.at[t].set(xt)
+    return Z(x.swapaxes(0,1)) @ lm_head
+
+def model3(params, x):
+    Wi, Wo, lm_head, wte = params
+    nl = Wi.shape[0]
+    x = wte[x].swapaxes(0, 1)
+    assert x.shape == (T, B, C)
+    # swap layer & token loops, but otherwise the same for now
+    S = jp.zeros((nl, B, nh, hs, hs))
+    Xt = jp.zeros((nl, B, C))
+    for t in range(T + nl - 1):
+        if t < T:
+            Xt = Xt.at[0].set(x[t])
+        S, Xt = jax.vmap(model2_layer)(S, Wi, Wo, Xt)
+        if t > (nl - 1):
+            x = x.at[t-(nl-1)].set(Xt[-1])
+        Xt = Xt.at[1:].set(Xt[:-1])
+    return Z(x.swapaxes(0,1)) @ lm_head
+
+model = model3
 
 def loss(W, x, y):
     logits = model(W, x)
@@ -49,7 +96,8 @@ def loss(W, x, y):
 from jax.example_libraries.optimizers import adam
 oinit, oup, oget = adam(3e-4)
 o = oinit(p0)
-jvg = jax.jit(jax.value_and_grad(loss))
+jvg = jax.value_and_grad(loss)
+# jvg = jax.jit(jvg)
 for i in range(201):
     v, g = jvg(oget(o), *get_batch('train'))
     o = oup(i, g, o)

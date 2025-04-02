@@ -268,9 +268,38 @@ right now, this requires a pile of python, but small problems could
 train faster enough with a simple binary, similar to tools for CSV like
 xan.
 
+### similar linear mechanisms
+
+we implement the simplest
+variant (mhsa/lsa) in very similar form in `femtogpt.py`, just two lines
+difference:
+
+```python
+q, k, v = ... # each (T,B,nh,hs)
+if parallel:
+    s = jp.einsum('ibhd,jbhd->ijbh', phi(q), phi(k))
+    vt = jp.einsum('ijbh,ij,jbhd->ibhd', s, mask, v)
+else:
+    s = jp.cumsum(jp.einsum('tbhi,tbhj->tbhij', phi(k), v), axis=0)
+    vt = jp.einsum('tbhi,tbhij->tbhj', phi(q), state)
+```
+
+where we see the core difference: the token-parallel variant makes a
+salience matrix `s` (per batch el `b` and head `h`) which filters `v`.
+The sequential version accumulates k-v information in salience matrix
+`s` as a approx of `-<Sk,v>` then filters query `q`.
+
 ### layer parallelism
 
-when we consider putting the layers into brain regions, the layers
-evaluate in parallel. how do we do this?
+layers can operate in parallel? conventionally, a layer processes all
+tokens at once, i.e. the `q,k,v` values have all `C` tokens, and the
+`vt` output has also all `C` tokens.  but we can consider evaluating the
+layer token by token, most obviously with the non-parallel version, by
+inverting the loops over layer and then token.  This is implemented
+by `model2`, which starts to help see how to parallelize the layers:
+
+We could operate on multiple layers, just by
+`jax.vmap(model2_layer)(S, Wi, Wo, Xt)`, but what should `Xt` be?
+
 
 
