@@ -298,8 +298,30 @@ layer token by token, most obviously with the non-parallel version, by
 inverting the loops over layer and then token.  This is implemented
 by `model2`, which starts to help see how to parallelize the layers:
 
-We could operate on multiple layers, just by
-`jax.vmap(model2_layer)(S, Wi, Wo, Xt)`, but what should `Xt` be?
+We create states `Xt` for each layer's input, then evaluate the layers
+in parallel, shifting `Xt` values layer to layer.
+the main trick is that we stagger teh input and output:
+`Xt[0]` should always be the input token and `Xt[-1]` is the output
+token, but we need to run the loop `T + nl - 1` times to ensure that
+`Xt[-1]` is the transformation of `Xt[0]`.
 
+The layers can be evaluated in parallel by `jax.vmap`ing or by rewriting
+`model2_layers` to handle layer dims.
 
+### online training
+
+since we can loop over tokens in time, it also means we compute losses
+and gradients online, especially if we lose the batch dim. one could
+repeat history to descend loss.
+
+### tvb interpretation
+
+#### sequential case
+
+in sequential case, we maintain a state matrix `(hs, hs)` per head,
+so a number of nodes would be `nl * nh`.
+
+`Xt` are node inputs mapped by `Wi`, and outputs mapped to next layer
+of heads, w/ skip connection.  I think this can be mapped out in terms
+of connectivity, but I'm not sure yet.
 

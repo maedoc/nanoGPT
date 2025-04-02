@@ -94,12 +94,15 @@ def loss(W, x, y):
     return ll.mean()
 
 from jax.example_libraries.optimizers import adam
-oinit, oup, oget = adam(3e-4)
+oinit, oup, oget = adam(1e-4)
 o = oinit(p0)
 jvg = jax.value_and_grad(loss)
 jvg = jax.jit(jvg)
-for i in range(201):
-    v, g = jvg(oget(o), *get_batch('train'))
-    o = oup(i, g, o)
-    if i % 20 == 0:
-        print(i, v)
+for lr in [1e-4, 5e-5]:
+    _, oup, _ = adam(lr)
+    for i in range(2001):
+        v, g = jvg(oget(o), *get_batch('train'))
+        o = oup(i, g, o)
+        mx = jax.tree_util.tree_map(lambda g: jp.max(jp.abs(g)).item(), g)
+        if i % 20 == 0:
+            print(i, v, mx)
