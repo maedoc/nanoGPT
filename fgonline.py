@@ -2,19 +2,20 @@ import numpy as np, os, pickle, tqdm, jax, jax.numpy as jp
 
 # setup
 key = jax.random.PRNGKey(42)
-batch_size = 8
-n_layer, n_head, n_embd, vocab_size = 4, 3, 3*32, 65
+batch_size = 1
+nl, n_head, vocab_size = 2, 2, 65
+n_embd = n_head * 8
 nh, hs = n_head, n_embd//n_head
 B, C = batch_size, n_embd
 
 # params
 wte = jax.random.normal(key, shape=(vocab_size, n_embd)) * 0.0002
-Wi = jax.random.normal(key, shape=(n_layer, n_embd, 3*n_embd)) * 0.0001
-Wo = jax.random.normal(key, shape=(n_layer, n_embd, n_embd)) * 0.0001
+Wi = jax.random.normal(key, shape=(nl, n_embd, 3*n_embd)) * 0.0001
+Wo = jax.random.normal(key, shape=(nl, n_embd, n_embd)) * 0.0001
 lm_head = jax.random.normal(key, shape=(n_embd, vocab_size)) * 0.0001
 p0 = Wi, Wo, lm_head, wte
 param_counts = sum(jax.tree_util.tree_map(lambda p: p.size, p0))
-print(f'{param_counts/1e6:0.2f} M params')
+print(f'{param_counts>>10} K params')
 
 Z = lambda x: (x - x.mean(axis=-1)[...,None])/x.std(ddof=1, axis=-1)[...,None]
 
@@ -25,39 +26,33 @@ def model2_layer(s, wi, wo, xt, phi=jax.nn.gelu):
     xt = vt.reshape(B,C) @ wo + xt
     return s, xt
 
-def model(params, x, S, outputs):
-    Wi, Wo, lm_head, wte = params
-    x = wte[x].swapaxes(0, 1)
-    assert x.shape == (T, B, C)
-    # swap layer & token loops, but otherwise the same for now
-    # if 
-    S = jp.zeros((nl, B, nh, hs, hs))
-    outputs = jp.zeros((nl, B, C)) + 1e-3
-    def op(c, x):
-        s, o = c
+@jax.jit
+def step(pso, ix, iy, lr=1e-4):
+    p, s, o = pso
+    def f(p, s, o):
+        Wi, Wo, lm_head, wte = p
+        x = wte[ix]
         i = jp.concat([x.reshape(1, B, C), o[:-1]])
         s, o = jax.vmap(model2_layer)(s, Wi, Wo, i)
-        return (s, o), o[-1]
-    x_ = jp.pad(x, [(0,nl-1),(0,0),(0,0)], constant_values=1e-4)
-    (s,o), x_ = jax.lax.scan(op, (S,outputs), x_)
-    x = x_[nl-1:]
-    return Z(x.swapaxes(0, 1)) @ lm_head
-
-def loss(W, x, y):
-    logits = model(W, x)
-    yoh = jax.nn.one_hot(y, logits.shape[-1])
-    ll = -(jax.nn.log_softmax(logits, axis=-1) * yoh).sum(axis=-1)
-    return ll.mean()
-
-from jax.example_libraries.optimizers import adam
-oinit, oup, oget = adam(1e-4)
-o = oinit(p0)
-jvg = jax.value_and_grad(loss)
-jvg = jax.jit(jvg)
-for lr in [1e-4, 5e-5]:
-    _, oup, _ = adam(lr)
-    for i in range(2001):
-        v, g = jvg(oget(o), *get_batch('train'))
-        o = oup(i, g, o)
-        if i % 20 == 0:
-            print(i, v)
+        logits = Z(o[-1]) @ lm_head
+        yoh = jax.nn.one_hot(iy, logits.shape[-1])
+        ll = -(jax.nn.log_softmax(logits, axis=-1) * yoh).sum(axis=-1)
+        return ll[0], s, o
+    p, _ = jax.lax.scan(lambda p, i: (
+        jax.tree_util.tree_map(
+            lambda p,g: p-lr*g, p,
+            jax.grad(lambda p: f(p, s, o)[0])(p)), None), p, jp.r_[:20])
+    ll, s, o = f(p, s, o)  # final prediction
+    return (p, s, o), ll
+    
+s = jp.zeros((nl, B, nh, hs, hs))
+o = jp.zeros((nl, B, C)) + 1e-3
+pso = p0, s, o
+import tqdm
+data = np.r_[:vocab_size]
+np.random.shuffle(data)
+print(data)
+for i in (pbar := tqdm.trange(50000)):
+    pso, ll = step(pso, data[i%data.size], data[(i+1)%data.size])
+    if i % 10 == 0:
+        pbar.set_description(f'll = {ll:0.2f}')
