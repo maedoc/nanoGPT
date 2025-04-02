@@ -75,7 +75,7 @@ def model3(params, x):
     assert x.shape == (T, B, C)
     # swap layer & token loops, but otherwise the same for now
     S = jp.zeros((nl, B, nh, hs, hs))
-    Xt = jp.zeros((nl, B, C))
+    Xt = jp.zeros((nl, B, C)) + 1e-3
     for t in range(T + nl - 1):
         if t < T:
             Xt = Xt.at[0].set(x[t])
@@ -83,7 +83,7 @@ def model3(params, x):
         if t > (nl - 1):
             x = x.at[t-(nl-1)].set(Xt[-1])
         Xt = Xt.at[1:].set(Xt[:-1])
-    return Z(x.swapaxes(0,1)) @ lm_head
+    return Z(x.swapaxes(0, 1)) @ lm_head
 
 model = model3
 
@@ -97,7 +97,7 @@ from jax.example_libraries.optimizers import adam
 oinit, oup, oget = adam(3e-4)
 o = oinit(p0)
 jvg = jax.value_and_grad(loss)
-# jvg = jax.jit(jvg)
+jvg = jax.jit(jvg)
 for i in range(201):
     v, g = jvg(oget(o), *get_batch('train'))
     o = oup(i, g, o)
