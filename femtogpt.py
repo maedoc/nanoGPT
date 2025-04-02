@@ -68,7 +68,8 @@ def model2(params, x):
         x = x.at[t].set(xt)
     return Z(x.swapaxes(0,1)) @ lm_head
 
-def model3(params, x):
+
+def model3_dbg(params, x):
     Wi, Wo, lm_head, wte = params
     nl = Wi.shape[0]
     x = wte[x].swapaxes(0, 1)
@@ -96,6 +97,25 @@ def model3(params, x):
             inputs = jp.concat([x[t].reshape(1, B, C), outputs[:-1]])
             S, outputs = jax.vmap(model2_layer)(S, Wi, Wo, inputs)
             x = x.at[t-(nl-1)].set(outputs[-1])
+    return Z(x.swapaxes(0, 1)) @ lm_head
+
+
+def model3(params, x):
+    Wi, Wo, lm_head, wte = params
+    nl = Wi.shape[0]
+    x = wte[x].swapaxes(0, 1)
+    assert x.shape == (T, B, C)
+    # swap layer & token loops, but otherwise the same for now
+    S = jp.zeros((nl, B, nh, hs, hs))
+    outputs = jp.zeros((nl, B, C)) + 1e-3
+    def op(c, x):
+        s, o = c
+        i = jp.concat([x.reshape(1, B, C), o[:-1]])
+        s, o = jax.vmap(model2_layer)(s, Wi, Wo, i)
+        return (s, o), o[-1]
+    x_ = jp.pad(x, [(0,nl-1),(0,0),(0,0)], constant_values=1e-4)
+    (s,o), x_ = jax.lax.scan(op, (S,outputs), x_)
+    x = x_[nl-1:]
     return Z(x.swapaxes(0, 1)) @ lm_head
 
 model = model3
