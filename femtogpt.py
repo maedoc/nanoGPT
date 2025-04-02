@@ -14,7 +14,7 @@ def get_batch(split):
 key = jax.random.PRNGKey(42)
 block_size = 16 # context length
 batch_size = 8
-n_layer, n_head, n_embd, vocab_size = 4, 3, 24, 65
+n_layer, n_head, n_embd, vocab_size = 4, 3, 3*32, 65
 nh, hs = n_head, n_embd//n_head
 B, T, C = batch_size, block_size, n_embd
 mask = jp.tril(jp.ones((T,T)))
@@ -75,14 +75,27 @@ def model3(params, x):
     assert x.shape == (T, B, C)
     # swap layer & token loops, but otherwise the same for now
     S = jp.zeros((nl, B, nh, hs, hs))
-    Xt = jp.zeros((nl, B, C)) + 1e-3
-    for t in range(T + nl - 1):
-        if t < T:
-            Xt = Xt.at[0].set(x[t])
-        S, Xt = jax.vmap(model2_layer)(S, Wi, Wo, Xt)
-        if t > (nl - 1):
-            x = x.at[t-(nl-1)].set(Xt[-1])
-        Xt = Xt.at[1:].set(Xt[:-1])
+    outputs = jp.zeros((nl, B, C)) + 1e-3
+    if True:
+        def op(c, x):
+            s, o = c
+            i = jp.concat([x.reshape(1, B, C), o[:-1]])
+            s, o = jax.vmap(model2_layer)(s, Wi, Wo, i)
+            return (s, o), o[-1]
+        if False:
+            x_ = jp.pad(x, [(0,nl-1),(0,0),(0,0)], constant_values=1e-4)
+            for t, x_in in enumerate(x_):
+                (S, outputs), x_out = op((S, outputs), x_in)
+                x_ = x_.at[t].set(x_out)
+        else:
+            x_ = jp.pad(x, [(0,nl-1),(0,0),(0,0)], constant_values=1e-4)
+            (s,o), x_ = jax.lax.scan(op, (S,outputs), x_)
+        x = x_[nl-1:]
+    else:
+        for t in range(T + nl - 1):
+            inputs = jp.concat([x[t].reshape(1, B, C), outputs[:-1]])
+            S, outputs = jax.vmap(model2_layer)(S, Wi, Wo, inputs)
+            x = x.at[t-(nl-1)].set(outputs[-1])
     return Z(x.swapaxes(0, 1)) @ lm_head
 
 model = model3
@@ -103,6 +116,5 @@ for lr in [1e-4, 5e-5]:
     for i in range(2001):
         v, g = jvg(oget(o), *get_batch('train'))
         o = oup(i, g, o)
-        mx = jax.tree_util.tree_map(lambda g: jp.max(jp.abs(g)).item(), g)
         if i % 20 == 0:
-            print(i, v, mx)
+            print(i, v)
