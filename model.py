@@ -51,6 +51,7 @@ class CausalSelfAttention(nn.Module):
 
     def mhsa_forward(self, x, phi=torch.erf): #lambda x: 1/(1+torch.exp(-x))):  # torch.erf):
         B, T, C = x.size()
+        nh, hs = self.n_head, C // self.n_head
         # projection to cortex
         qkv = self.c_attn(x).view(B,T,3,self.n_head,C//self.n_head).permute(2,0,3,1,4)
         # layernorm/zscore/precision weighted prediction errors
@@ -64,6 +65,22 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         # thalamus has skip connection
         return x + y
+
+    # https://proceedings.mlr.press/v119/katharopoulos20a.html w/o Z
+    # does not work with saturating (on the right), needs relu/gelu etc
+    def lsa_forward(self, x, phi=F.gelu):#lambda x: 1/(1+torch.exp(-x))):  # torch.erf):
+        B, T, C = x.size()
+        nh, hs = self.n_head, C // self.n_head
+        qkv = self.c_attn(x).view(B,T,3,nh,hs) # (B,T,3,nh,hs)
+        qkv = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
+        q, k, v = qkv.transpose(0,2)
+        # state updates can be done recurrently or batch like here for training
+        ds = torch.einsum('tbhi,tbhj->tbhij', phi(k), v)
+        state = torch.cumsum(ds, dim=0)
+        vt = torch.einsum('tbhi,tbhij->tbhj', phi(q), state)
+        y = vt.transpose(0, 1).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return x + y  # skip  here important for performance, don't remove
 
     # https://raw.githubusercontent.com/BlinkDL/RWKV-LM/main/RWKV-v7.png
     # but very close to linear self attention yet learns faster? @iter1000 vl 1.79
@@ -123,21 +140,6 @@ class CausalSelfAttention(nn.Module):
         # thalamus has skip connection
         return x + y
 
-    # https://proceedings.mlr.press/v119/katharopoulos20a.html w/o Z
-    # does not work with saturating (on the right), needs relu/gelu etc
-    def lsa_forward(self, x, phi=F.gelu):#lambda x: 1/(1+torch.exp(-x))):  # torch.erf):
-        B, T, C = x.size()
-        nh, hs = self.n_head, C // self.n_head
-        qkv = self.c_attn(x).view(B,T,3,nh,hs) # (B,T,3,nh,hs)
-        qkv = (qkv - qkv.mean(axis=-1)[...,None]) / qkv.std(dim=-1)[...,None]
-        q, k, v = qkv.transpose(0,2)
-        # state updates can be done recurrently or batch like here for training
-        ds = torch.einsum('tbhi,tbhj->tbhij', phi(k), v)
-        state = torch.cumsum(ds, dim=0)
-        vt = torch.einsum('tbhi,tbhij->tbhj', phi(q), state)
-        y = vt.transpose(0, 1).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
-        return x + y  # skip  here important for performance, don't remove
 
 
 

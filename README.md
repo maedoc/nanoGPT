@@ -225,3 +225,52 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## maedoc's modifications
+
+### attention mechanisms
+
+I added few non-softmax attention thingies, as additional methods on
+`model.py::CausalSelfAttention`,
+
+- `mhsa_forward` implements linear self attention but in a sequence parallel
+   and therefore quadratic in T
+- `lsa_forwad` implements linear self attention, with state matrix
+- `rkwv7` and `deltanet` and two variants of `lsa` that perform better by
+   decaying the state matrix instead of continuing to add to it
+
+### removals
+
+I removed a lot of things from the original nanogpt since they aren't necessary
+for attention to get good perf for shakespeare char model:
+
+- MLP layers are gone
+- layer norms replaced by just z-score `(x - x.mean())/x.std()`
+- position encoding removed to make longer-than-context-length generation
+  very easy
+
+the result performs reltively well while still being easy to train on small
+problems on CPU.
+
+### z-score
+
+The z-score is what happens inside a layer norm anyway, with some learnable
+scaling and offset, but it seems the latter isn't required.
+
+In the brain, this also evokes the notion of precision-weighted (i.e.
+`/x.std()`) prediction errors (`x - x.mean()`).  Since this happens
+per token per head, the interpretation would be that the embedded per-head
+token is a kind of sample from a distribution?
+
+### tooling
+
+right now, this requires a pile of python, but small problems could
+train faster enough with a simple binary, similar to tools for CSV like
+xan.
+
+### layer parallelism
+
+when we consider putting the layers into brain regions, the layers
+evaluate in parallel. how do we do this?
+
+
