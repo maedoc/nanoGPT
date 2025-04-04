@@ -9,7 +9,15 @@ def generate_sequence(length):
 
 def generate_batch(batch_size, num_tokens):
     """Generate a batch of sequences with fixed length."""
-    batch = [generate_sequence(num_tokens)[:num_tokens] for _ in range(batch_size)]
+    batch = []
+    for _ in range(batch_size):
+        seq = generate_sequence(num_tokens)
+        if len(seq) < num_tokens:
+            seq = np.pad(seq, (0, num_tokens - len(seq)), 'constant')
+        else:
+            seq = seq[:num_tokens]
+        batch.append(seq)
+    return np.array(batch)
     return np.array(batch)
 
 # Example usage
