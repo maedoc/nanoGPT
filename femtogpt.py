@@ -12,9 +12,9 @@ def get_batch(split):
 
 # setup
 key = jax.random.PRNGKey(42)
-block_size = 16 # context length
-batch_size = 8
-n_layer, n_head, n_embd, vocab_size = 4, 3, 3*32, 65
+block_size = 32 # context length
+batch_size = 32
+n_layer, n_head, n_embd, vocab_size = 4, 4, 4*32, 65
 nh, hs = n_head, n_embd//n_head
 B, T, C = batch_size, block_size, n_embd
 mask = jp.tril(jp.ones((T,T)))
@@ -118,7 +118,7 @@ def model3(params, x):
     x = x_[nl-1:]
     return Z(x.swapaxes(0, 1)) @ lm_head
 
-model = model3
+model = model1
 
 def loss(W, x, y):
     logits = model(W, x)
