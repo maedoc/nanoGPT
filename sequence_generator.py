@@ -1,8 +1,9 @@
 import numpy as np
 
 def generate_sequence(length):
-    """Generate a sequence of 4 random numbers between 0 and 9, repeated until the desired length."""
-    base_sequence = np.random.randint(0, 10, size=4)
+    """Generate a sequence of random length (between 2 and 5) random numbers between 0 and 9, repeated until the desired length."""
+    base_length = np.random.randint(2, 6)
+    base_sequence = np.random.randint(0, 10, size=base_length)
     full_sequence = np.tile(base_sequence, (length // 4 + 1))[:length]
     return full_sequence
 
