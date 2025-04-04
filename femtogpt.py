@@ -3,8 +3,9 @@ from sequence_generator import generate_batch
 
 # data
 def get_batch(split):
-    x = generate_batch(batch_size, block_size)
-    y = np.roll(x, -1, axis=1)  # Shift the batch to create next token targets
+    x = generate_batch(batch_size, block_size + 1)
+    y = x[:, 1:]  # Next token targets by slicing
+    x = x[:, :-1]  # Remove the extra token from x
     return jp.array(x), jp.array(y)  # token, next token
 
 # setup
