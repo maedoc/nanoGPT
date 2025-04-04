@@ -8,8 +8,8 @@ def generate_sequence(length):
     return full_sequence
 
 def generate_batch(batch_size, num_tokens):
-    """Generate a batch of sequences."""
-    batch = [generate_sequence(num_tokens) for _ in range(batch_size)]
+    """Generate a batch of sequences with fixed length."""
+    batch = [generate_sequence(num_tokens)[:num_tokens] for _ in range(batch_size)]
     return np.array(batch)
 
 # Example usage
