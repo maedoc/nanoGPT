@@ -1,14 +1,11 @@
 import numpy as np, os, pickle, tqdm, jax, jax.numpy as jp
+from sequence_generator import generate_batch
 
 # data
-data_dir = os.path.join('data', 'shakespeare_char')
 def get_batch(split):
-    fname = 'train.bin' if split == 'train' else 'val.bin'
-    data = np.memmap(os.path.join(data_dir, fname), dtype=np.uint16, mode='r')
-    ix = np.random.randint(len(data) - block_size, size=(batch_size,))
-    x = jp.stack([(data[i:i+block_size]).astype(np.int64) for i in ix])
-    y = jp.stack([(data[i+1:i+1+block_size]).astype(np.int64) for i in ix])
-    return x, y  # token, next token
+    x = generate_batch(batch_size, block_size)
+    y = np.roll(x, -1, axis=1)  # Shift the batch to create next token targets
+    return jp.array(x), jp.array(y)  # token, next token
 
 # setup
 key = jax.random.PRNGKey(42)
