@@ -14,7 +14,7 @@ def get_batch(split):
 key = jax.random.PRNGKey(42)
 block_size = 16 # context length
 batch_size = 8
-n_layer, n_head, n_embd, vocab_size = 4, 3, 3*32, 65
+n_layer, n_head, n_embd, vocab_size = 2, 3, 3*32, 65
 nh, hs = n_head, n_embd//n_head
 B, T, C = batch_size, block_size, n_embd
 mask = jp.tril(jp.ones((T,T)))
@@ -30,20 +30,58 @@ print(f'{param_counts/1e6:0.2f} M params')
 
 Z = lambda x: (x - x.mean(axis=-1)[...,None])/x.std(ddof=1, axis=-1)[...,None]
 
-parallel = True
-def model1(params, x, phi=jax.nn.gelu):
+def model1_(params, x, phi=jax.nn.gelu, parallel=True):
     Wi, Wo, lm_head, wte = params
     x = wte[x] # B, T, C
     for wi, wo in zip(Wi, Wo):
-        q, k, v = Z(jp.einsum('ij,bti->btj', wi, x).reshape(B,T,3,nh,hs)).swapaxes(0,2)  # (3,T,B,nh,hs)
+        # linear projections
+        q, k, v = jp.einsum('ij,bti->btj', wi, x).reshape(B,T,3,nh,hs).swapaxes(0,2)  # (3,T,B,nh,hs)
+        # only nonlinearities here:
+        q, k, v = phi(Z(q)), phi(Z(k)), Z(v)
+        # rest is linear, v (nh,hs) -> (nh,hs), per layer
         if parallel:
-            s = jp.einsum('ibhd,jbhd->ijbh', phi(q), phi(k))
+            s = jp.einsum('ibhd,jbhd->ijbh', q, k)
             vt = jp.einsum('ijbh,ij,jbhd->ibhd', s, mask, v)
         else:
-            state = jp.cumsum(jp.einsum('tbhi,tbhj->tbhij', phi(k), v), axis=0)
-            vt = jp.einsum('tbhi,tbhij->tbhj', phi(q), state)
+            state = jp.cumsum(jp.einsum('tbhi,tbhj->tbhij', k, v), axis=0)
+            vt = jp.einsum('tbhi,tbhij->tbhj', q, state)
         x = vt.swapaxes(0,1).reshape(B,T,C) @ wo + x
     return Z(x) @ lm_head
+
+# could have a spatiotemporal attention: a ssequence of vector of tokens
+# which should first do parallel attn then sequential? or if its linear,
+# doesn't matter? then dimensions per layer choose whether the attention
+# is more spatial (i.e. more parallel) or more temporal (sequential).
+# probably interacts with time scales, e.g. parallel is faster while
+# sequential is slower.
+def modelst(params, x, phi=jax.nn.gelu, parallel=True):
+    Wi, Wo, lm_head, wte = params
+    x = wte[x] # B, T, P, C
+    P = 8
+    for wi, wo in zip(Wi, Wo):
+        # linear projections
+        # XXX p is new index for parallel token size
+        q, k, v = jp.einsum('ij,btpi->btpj', wi, x).reshape(B,T,P,3,nh,hs).swapaxes(0,3)  # (3,T,P,B,nh,hs)
+        # only nonlinearities here:
+        q, k, v = phi(Z(q)), phi(Z(k)), Z(v)
+        # parallel salience, seq sal
+        sp = jp.einsum('tpbhi,tPbhi->tpPbhi', q, k)  # NOTE: ignoring mask for now
+        ss = jp.einsum('tpbhi,tpbhj->tpbhij', k, v)
+        ss = jp.cumsum(ss, axis=0)  # tpbhij
+        # apply
+        vp = jp.einsum('tpPbhi,tPbhi->tpbhi', sp, v)
+        vs = jp.einsum('tpbhij,tpbhi->tpbhj', ss, q)
+        vt = vp + vs  # ?
+        x = vt.swapaxes(0,1).reshape(B,T,C) @ wo + x
+    return Z(x) @ lm_head
+
+
+def model1(params, x):
+    xp = model1_(params, x, parallel=True)
+    xs = model1_(params, x, parallel=False)
+    e = jp.abs(xp - xs).max()
+    jax.debug.print("max(abs(xp - xs)) = {e}", e=e)
+    return (xp + xs)/2
 
 
 def model2_layer(s, wi, wo, xt, phi=jax.nn.gelu):
@@ -118,7 +156,7 @@ def model3(params, x):
     x = x_[nl-1:]
     return Z(x.swapaxes(0, 1)) @ lm_head
 
-model = model3
+model = model1
 
 def loss(W, x, y):
     logits = model(W, x)
@@ -133,7 +171,7 @@ jvg = jax.value_and_grad(loss)
 jvg = jax.jit(jvg)
 for lr in [1e-4, 5e-5]:
     _, oup, _ = adam(lr)
-    for i in range(2001):
+    for i in range(201):
         v, g = jvg(oget(o), *get_batch('train'))
         o = oup(i, g, o)
         if i % 20 == 0:
