@@ -13,9 +13,9 @@ def get_batch(split):
 
 # setup
 key = jax.random.PRNGKey(42)
-block_size = 64 # context length
-batch_size = 8
-n_layer, n_head, n_embd, vocab_size = 6, 8, 8*32, 65
+block_size = 128 # context length
+batch_size = 32
+n_layer, n_head, n_embd, vocab_size = 6, 12, 12*32, 65
 nh, hs = n_head, n_embd//n_head
 B, T, P, C = batch_size, block_size, 8, n_embd
 mask = jp.tril(jp.ones((P, P)))
@@ -64,10 +64,14 @@ oinit, oup, oget = adam(1e-4)
 o = oinit(p0)
 jvg = jax.value_and_grad(loss)
 jvg = jax.jit(jvg)
-for lr in [1e-4, 5e-5]:
+for lr in [1e-3, 1e-4, 5e-5]:
     _, oup, _ = adam(lr)
-    for i in range(2001):
+    for i in range(1001):
         v, g = jvg(oget(o), *get_batch('train'))
         o = oup(i, g, o)
         if i % 20 == 0:
             print(i, v)
+
+import pickle
+with open('2d.pkl', 'wb') as fd:
+    pickle.dump(oget(o), fd)

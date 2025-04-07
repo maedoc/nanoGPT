@@ -3,7 +3,7 @@ import numpy as np, os, pickle, tqdm, jax, jax.numpy as jp
 # setup
 key = jax.random.PRNGKey(42)
 batch_size = 1
-nl, n_head, vocab_size = 8, 8, 65
+nl, n_head, vocab_size = 12, 12, 65
 n_embd = n_head * 32
 nh, hs = n_head, n_embd // n_head
 B, C = batch_size, n_embd
@@ -26,8 +26,9 @@ def model2_layer(s, wi, wo, xt, phi=jax.nn.gelu):
     xt = vt.reshape(B,C) @ wo + xt
     return s, xt
 
+
 @jax.jit
-def step(pso, ix, iy, lr=1e-4):
+def step(pso, ix, iy):
     p, s, o = pso
     def f(p, s, o):
         Wi, Wo, lm_head, wte = p
@@ -38,7 +39,23 @@ def step(pso, ix, iy, lr=1e-4):
         yoh = jax.nn.one_hot(iy, logits.shape[-1])
         ll = -(jax.nn.log_softmax(logits, axis=-1) * yoh).sum(axis=-1)
         return ll[0], s, o
-    ll0, _, _ = f(p, s, o)  # initial prediction
+    ll0, s0, o0 = f(p, s, o)  # initial prediction
+    return (p,s0,o0), ll0
+
+
+@jax.jit
+def step_learn(pso, ix, iy, lr=1e-4):
+    p, s, o = pso
+    def f(p, s, o):
+        Wi, Wo, lm_head, wte = p
+        x = wte[ix]
+        i = jp.concat([x.reshape(1, B, C), o[:-1]])
+        s, o = jax.vmap(model2_layer)(s, Wi, Wo, i)
+        logits = Z(o[-1]) @ lm_head
+        yoh = jax.nn.one_hot(iy, logits.shape[-1])
+        ll = -(jax.nn.log_softmax(logits, axis=-1) * yoh).sum(axis=-1)
+        return ll[0], s, o
+    ll0, s0, o0 = f(p, s, o)  # initial prediction
     # ll is 0 to 5 or so, use it to choose number of gradient steps
     nsteps = jp.array([(ll0+1)**2], jp.int32)[0]
     whval = nsteps, p
@@ -56,12 +73,6 @@ def step(pso, ix, iy, lr=1e-4):
 
     _, p = jax.lax.while_loop(whcond, whbody, whval)
 
-    if False:
-        p, _ = jax.lax.scan(lambda p, i: (
-            jax.tree_util.tree_map(
-                lambda p,g: p-lr*g, p,
-                jax.grad(lambda p: f(p, s, o)[0])(p)), None), p, jp.r_[:nsteps])
-
     ll1, s, o = f(p, s, o)  # final prediction
     return (p, s, o), ll0, ll1, nsteps
 
@@ -75,10 +86,24 @@ if False:
     np.random.shuffle(data)
 else:
     import genarith
-    data = np.array(genarith.gentokens(50000))
+    data = np.array(genarith.gentokens(5_000_000))
+    ieq, iX = ord('='), ord('X')
+
+predicting_answer = False
+ll_answer = 0
+ntok_answer = 1
 for i in (pbar := tqdm.trange(data.size-1)):
     ix, iy = data[i], data[i+1]
-    pso, ll0, ll1, nn = step(pso, ix, iy)
-    if i > 10:
+    if ix == ieq:
+        predicting_answer = True
+    if iy == iX:
+        predicting_answer = False  # in principle, model should know it's done?
+    if predicting_answer:
+        pso, ll0, ll1, nn = step_learn(pso, ix, iy)
+        ntok_answer += 1
+        ll_answer += ll0  # surprise prior to learning
+    else:
+        pso, ll0 = step(pso, ix, iy)
+    if i > 10 and (i%10 ==0):
         expr = ''.join([chr(_) for _ in data[i-9:i+1]])
-        pbar.set_description(f'"{expr}: {ll0:+0.2f}->{ll1:+0.2f}"')
+        pbar.set_description(f'{expr}: {ll_answer/ntok_answer:+0.3f}')

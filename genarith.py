@@ -1,13 +1,13 @@
 import random
 
 numbers = '123456789'
-ops = '+ - * % //'.split(' ')
+ops = '+ -'.split(' ')
 
 
 def make_basic(hard):
     expr = random.choice(numbers)
-    for i in range(random.randint(0, hard)):
-        expr = f'{expr} {random.choice(ops)} {random.choice(numbers)}'
+    for i in range(hard):
+        expr = f'{expr}{random.choice(ops)}{random.choice(numbers)}'
     return expr
 
 
@@ -17,8 +17,8 @@ def make_full(hard):
             expr = make_basic(hard)
             for i in range(random.randint(0, hard)):
                 expr = f'({expr}) {random.choice(ops)} ({make_basic(hard)})'
-            expr = f'{expr} = {eval(expr)}X'
-            return expr
+            answ = eval(expr)
+            return expr, answ
         except:
             pass
 
@@ -26,10 +26,13 @@ def make_full(hard):
 def gentokens(ntok):
     alle = 'X'
     while len(alle) < ntok:
-        e = make_full(2)
+        e, a = make_full(4)
+        print(e, '=', a)
         alle = alle + e
     return [ord(_) for _ in alle]
 
 
 if __name__ == '__main__':
-    print(gentokens(35))
+    import numpy as np
+    print(np.array(gentokens(75)))
+    # print(make_full(1))
