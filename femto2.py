@@ -14,8 +14,8 @@ def get_batch(split):
 key = jax.random.PRNGKey(42)
 block_size = 256 # context length
 batch_size = 32
-n_head = 8
-n_layer, n_embd, vocab_size = 2, n_head*32, 65
+n_head = 4
+n_layer, n_embd, vocab_size = 2, n_head*16, 65
 nh, hs = n_head, n_embd//n_head
 B, T, C = batch_size, block_size, n_embd
 
@@ -73,5 +73,8 @@ for lr in [1e-3, 1e-4]:
     for i in range(1001):
         v, g = jvg(oget(o), *get_batch('train'))
         o = oup(i, g, o)
-        if i % 100 == 0:
+        if i % 1000 == 0:
             print(i, v, 'b', oget(o)[-1].mean(axis=-1))
+
+with open('femto2.pkl', 'wb') as fd:
+    pickle.dump(oget(o), fd)
