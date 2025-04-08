@@ -73,7 +73,7 @@ for lr in [1e-3, 1e-4]:
     for i in range(1001):
         v, g = jvg(oget(o), *get_batch('train'))
         o = oup(i, g, o)
-        if i % 1000 == 0:
+        if i % 10 == 0:
             print(i, v, 'b', oget(o)[-1].mean(axis=-1))
 
 with open('femto2.pkl', 'wb') as fd:
