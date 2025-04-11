@@ -19,11 +19,104 @@ wte_q = (wte * wte_scl).astype(np.int8)
 p0_ = []
 qp = {}
 for key, p in zip('Wi Wo lm_head wte b'.split(' '), p0):
-    p_scl = 127/np.abs(p).max()
-    p_q = (p * p_scl).astype(np.int8)
+    p_scl = 128 # 127/np.abs(p).max()
+    l2scl = int(np.log2(127/np.abs(p).max()))
+    p_scl = 2**l2scl
+    p_p_scl = p * p_scl
+    ppmax = np.abs(p_p_scl).max()
+    print(key, p_scl, ppmax)
+    assert ppmax < 127, (key, ppmax)
+    p_q = p_p_scl.astype(np.int8)
     p0_.append(p_q.astype('f') / p_scl)
-    qp[f'{key}'] = p_q, p_scl
+    qp[f'{key}'] = p_q, l2scl
 Wi, Wo, lm_head, wte, b = p0 = p0_
+
+def compare(x,xq):
+    import pylab as pl
+    pl.plot(xq.reshape(-1), x.reshape(-1), 'k.')
+    pl.grid(1)
+    pl.savefig('xq.png')
+    os.system('xdg-open xq.png')
+    np.testing.assert_allclose(xq, x)
+    1/0
+
+def overhead(*arrays):
+    "checks arrays can be multiplied w/o overflowing int32"
+    aa = lambda a: np.abs(a).max().astype(np.int64)**2
+    imax = np.iinfo(np.int32).max
+    for i, a in enumerate(arrays):
+        of = 0
+        while aa(a>>of) >= imax:
+            of += 1
+        assert aa(a) < imax, f'overflow, a[{i}]>>={of}'
+
+# quant test
+x = wte[0] @ Wi[0]
+q, k, v = x.reshape(3, nh, hs)
+kk = k[:, None]*k[:, :, None]
+vk = v[:, :, None]*k[:, None]
+
+wteq, wtep = qp['wte']
+Wiq, Wip = qp['Wi']
+
+# xq = wteq[0].astype(np.int32)[:,None] * Wiq[0].astype(np.int32)
+
+xq = wteq[0].astype(np.int32) @ Wiq[0].astype(np.int32)
+xp = wtep + Wip
+# compare(x*2**xp, xq)
+qq, kq, vq = xq.reshape(3, nh, hs)
+overhead(qq, kq, vq)
+
+kkq = kq[:, None]*kq[:, :, None]
+vkq = vq[:, :, None]*kq[:, None]
+kkp = xp*2
+vkp = xp*2
+# but this might overflow, so rshift here
+rs = 13
+kkq >>= rs
+vkq >>= rs
+kkp -= rs
+vkp -= rs
+overhead(kkq, vkq)
+# compare(kk, kkq.astype('f')/2**kkp)
+# compare(vk, vkq.astype('f')/2**kkp)
+
+# s = s*l + b2*vk, l = 1 - b0 - b1*kk
+sq, sp = vkq, vkp
+
+# bias values
+bq, bp = qp['b']
+b0q, b1q, b2q = bq.reshape(3, nh, 1, 1).astype(np.int32)
+b0, b1, b2 = b.reshape(3, nh, 1, 1)
+
+# l is tricky since it mixes scales
+# - b1*kk scale is bp+kkp
+# - b0 is just bp
+# - (b0<<kkp) will be bp+kkp
+# so lp should be bp+kkp, 1 becomes lp
+# 1 is just the scale itself, so just lp
+lp = bp + kkp
+lq = (1 << lp) - (b0q << kkp) - b1q*kkq
+overhead(b1q, kkq)
+rs = 15
+lq, lp = lq >> rs, lp-rs
+overhead(lq)  # -> lq >>= 7
+l = 1 - (b[0].reshape(-1, 1, 1) + b[1].reshape(-1, 1, 1)*kk)
+# compare(l, lq.astype('f')/2**lp)
+
+# s = s*l
+overhead(sq, lq)
+sq, sp = sq*lq, sp+lp
+# s is recurrent, sp needs to be constant but rs=lp results in prec loss
+rs = 15
+sq, sp = sq >> rs, sp - rs
+overhead(sq)
+
+s = vk
+s = s*l
+compare(s, sq.astype('f')/2**sp)
+
+1/0
 
 fdc = open('femto2-weights.c', 'w')
 fdh = open('femto2-weights.h', 'w')
