@@ -2,17 +2,20 @@ import numpy as np, os, pickle, tqdm, jax, jax.numpy as jp
 from sequence_generator import generate_batch
 
 # data
+data_dir = os.path.join('data', 'shakespeare_char')
 def get_batch(split):
-    x = generate_batch(batch_size, block_size + 1)
-    y = x[:, 1:]  # Next token targets by slicing
-    x = x[:, :-1]  # Remove the extra token from x
-    return jp.array(x), jp.array(y)  # token, next token
+    fname = 'train.bin' if split == 'train' else 'val.bin'
+    data = np.memmap(os.path.join(data_dir, fname), dtype=np.uint16, mode='r')
+    ix = np.random.randint(len(data) - block_size, size=(batch_size,))
+    x = jp.stack([(data[i:i+block_size]).astype(np.int64) for i in ix])
+    y = jp.stack([(data[i+1:i+1+block_size]).astype(np.int64) for i in ix])
+    return x, y  # token, next token
 
 # setup
 key = jax.random.PRNGKey(42)
-block_size = 32 # context length
-batch_size = 32
-n_layer, n_head, n_embd, vocab_size = 4, 4, 4*32, 65
+block_size = 64 # context length
+batch_size = 64
+n_layer, n_head, n_embd, vocab_size = 6, 6, 6*32, 65
 nh, hs = n_head, n_embd//n_head
 B, T, C = batch_size, block_size, n_embd
 mask = jp.tril(jp.ones((T,T)))
