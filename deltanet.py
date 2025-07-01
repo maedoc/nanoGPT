@@ -24,9 +24,9 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 key = jax.random.PRNGKey(42)
-block_size = 256  # context length
+block_size = 128 # context length
 batch_size = 32
-n_layer, n_head, n_embd, vocab_size = 8, 12, 384, meta_vocab_size
+n_layer, n_head, n_embd, vocab_size = 8, 6, 192, meta_vocab_size
 nh, hs = n_head, n_embd//n_head
 beta = 0.01
 
@@ -42,27 +42,54 @@ pos = jp.r_[:T]
 s0 = jp.zeros((B, nh, hs, hs))
 
 # rwkv7's w, eta <- (n_layer,2,nh,hs)
-Beta = jax.random.normal(key, shape=(n_layer,2,nh,hs)) * 1e-5 + 1e-2
+Wb = jax.random.normal(key, shape=(n_layer,2,nh,hs)) * 1e-5 + 1e-2
 
-def attn_op(s, qli):
+# def attn_op(s, qli):
+#     "core op in deltanet style attention"
+#     q, l, i = qli
+#     s = jp.einsum('bhij,bhjk->bhik', s, l) + i
+#     o = jp.einsum('bhij,bhj->bhi', s, q)
+#     return s, o
+# def fwd(params, x, phi=jax.nn.sigmoid):
+#     Wi, Wo, lm_head, wte, wpe, Beta = params
+#     x = wte[x] #+ wpe  # B,T,C
+#     z = lambda x: (x - x.mean(axis=-1)[...,None])/x.std(ddof=1, axis=-1)[...,None]
+#     for wi, wo, (b1,b2) in zip(Wi, Wo, Beta):
+#         q, k, v = z(jp.einsum('ij,bti->btj', wi, x).reshape(B,T,3,nh,hs)).swapaxes(0,2)
+#         q, k = phi(q), phi(k)
+#         L = b1.reshape(nh,hs,1) - jp.einsum('tbhi,tbhj->tbhij', k, k*b2)
+#         I = jp.einsum('tbhi,tbhj->tbhij', v, k*b2)
+#         _, jvt = jax.lax.scan(attn_op, s0, (q,L,I))
+#         x = jp.swapaxes(jvt,0,1).reshape(B,T,C) @ wo + x
+#     return z(x) @ lm_head
+
+def attn_op1h(s, qli):
     "core op in deltanet style attention"
     q, l, i = qli
-    s = jp.einsum('bhij,bhjk->bhik', s, l) + i
-    o = jp.einsum('bhj,bhij->bhi', q, s)
+    s = jp.einsum('bij,bjk->bik', s, l) + i
+    o = jp.einsum('bij,bj->bi', s, q)
     return s, o
+
+def attn1h(q,k,v,b1,b2,s0):
+    L = b1.reshape(hs,1) - jp.einsum('tbi,tbj->tbij', k, k*b2)
+    I = jp.einsum('tbi,tbj->tbij', v, k*b2)
+    _, jvt = jax.lax.scan(attn_op1h, s0, (q,L,I))
+    return jvt
+
 
 def fwd(params, x, phi=jax.nn.sigmoid):
     Wi, Wo, lm_head, wte, wpe, Beta = params
-    x = wte[x] + wpe  # B,T,C
+    x = wte[x] #+ wpe  # B,T,C
     z = lambda x: (x - x.mean(axis=-1)[...,None])/x.std(ddof=1, axis=-1)[...,None]
     for wi, wo, (b1,b2) in zip(Wi, Wo, Beta):
         q, k, v = z(jp.einsum('ij,bti->btj', wi, x).reshape(B,T,3,nh,hs)).swapaxes(0,2)
-        q, k = phi(k), phi(v)
-        L = b1.reshape(nh,hs,1) - jp.einsum('tbhi,tbhj->tbhij', k, k*b2)
-        I = jp.einsum('tbhi,tbhj->tbhij', k*b2, v)
-        _, jvt = jax.lax.scan(attn_op, s0, (q,L,I))
+        q, k = phi(q), phi(k)
+        ax = -2,-2,-2,-2,-2,-3
+        jvt = jax.vmap(attn1h, in_axes=ax, out_axes=-2)(q,k,v,b1,b2,s0)
+        # Jv = jax.jacobian(lambda v: attn(q,k,v,b1,b2))(v)
         x = jp.swapaxes(jvt,0,1).reshape(B,T,C) @ wo + x
     return z(x) @ lm_head
+
 
 def loss(W, x, y):
     logits = fwd(W, x)
@@ -70,11 +97,14 @@ def loss(W, x, y):
     ll = -(jax.nn.log_softmax(logits, axis=-1) * yoh).sum(axis=-1)
     return ll.mean()
 
-jvg = jax.jit(jax.value_and_grad(loss))
-jv = jax.jit(loss)
+jit = jax.jit
+# jit = lambda f: f
+jvg = jit(jax.value_and_grad(loss))
+jv = jit(loss)
 
-p0 = Wi, Wo, lm_head, wte, wpe, Beta
+p0 = Wi, Wo, lm_head, wte, wpe, Wb
 initv = jv(p0, x, y)
+assert jp.isfinite(initv)
 print('initial loss', initv)
 
 param_counts = sum(jax.tree_util.tree_map(lambda p: p.size, p0))
@@ -82,8 +112,8 @@ print('param count', f'{param_counts/1e6:0.2f} M params')
 
 
 warmup_iters = 100 # how many steps to warm up for
-lr_decay_iters = 9000 # should be ~= max_iters per Chinchilla
-learning_rate = 2e-4   # 1e-3 # max learning rate
+lr_decay_iters = 5000 # should be ~= max_iters per Chinchilla
+learning_rate = 4e-4   # 1e-3 # max learning rate
 min_lr = learning_rate/20 # learning_rate / 10 usually
 
 def get_lr(it):
